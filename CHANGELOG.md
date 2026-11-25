@@ -4,6 +4,34 @@
 
 ## [Unreleased]
 
+### 新增
+
+- Arch Linux / niri（Wayland）支持：Linux 可以与 macOS、Windows 或其他 Linux 电脑共享键鼠、同步剪贴板、互传文件。
+  Linux 直接使用 layer-shell、exclusive keyboard、pointer constraints、relative pointer、virtual pointer 和 virtual keyboard 协议，
+  不需要 root、uinput 或 evdev 权限；XKB 与 USB HID 双向映射，保留左右修饰键、媒体键、 Caps Lock 同步和断线松键。
+- Linux 设置界面与常驻后台：Flutter 原生 Linux 宿主、KSNI 托盘、单实例设置窗口、用户级 XDG autostart、权限与协议检查、
+  中文日志和诊断信息。`cargo xtask bundle` 生成可直接运行的 `target/bundle/linux/ScreenFerry/`。
+- Linux 剪贴板：通过限时、限大小的 `wl-copy` / `wl-paste` 读写系统剪贴板，沿用现有的格式协商、拉取和防回环机制。
+- 对端系统标识：新增能力位 `PLATFORM_INFO` 和消息 `PlatformInfo`，握手后双方报告 `macos`、`windows` 或 `linux`；
+  界面据此显示系统图标、名称和按键文案，不再按连接角色猜测。旧版对端不协商此能力，系统保持未知，连接与传输不受影响。
+
+### 改进
+
+- Linux 与 macOS 互通时，Command / Ctrl 的互换以双方实际系统为依据；Linux 使用非 Mac 的 XKB / Ctrl 习惯。
+- Linux 输入跟随 compositor 当前 XKB keymap，覆盖非美式布局与布局切换；锁定键只读取真实的 `mods_locked` 状态。
+  修复重复抓取时的旧指针约束、旋转或更改分辨率后的输入区域，以及连续与高分辨率滚轮累积。
+- 剪贴板平台调用移出异步运行时，并串行化 Linux 读写；断开会话会使尚未开始的过期写入失效，避免覆盖新会话内容。
+- README、架构与 IPC 文档补齐 Arch 依赖、niri 协议要求、KSNI 托盘、XDG 数据目录和 Linux 打包方式；
+  明确应用内自动更新仍只支持 macOS 和 Windows。
+- 新增 Linux / niri 与 macOS 交接文档，记录源码传输、macOS 编译、Linux 便携运行、双机验收和日志采集步骤。
+- Linux 不声明 `EDGE_DROP`，不会向对端发送自己无法处理的边缘投递提示；文件命令和普通文件传输照常工作。
+
+### 修复
+
+- 修正连接事件把本机系统误报成对端系统的问题；实际系统改由握手后的 `PlatformInfo` 告知。
+- 设置页恢复 Windows 的「Windows 习惯」和对应文本快捷键文案，Linux 继续显示「PC / XKB 习惯」。
+- Linux GTK runner 改用 `G_APPLICATION_DEFAULT_FLAGS`，避免新版 GTK 的弃用警告阻断启用 `-Werror` 的构建。
+
 ## [0.2.0] - 2026-11-10
 
 ### 新增
