@@ -698,6 +698,15 @@ where
                     }
                 }
             }
+            CaptureEvent::FocusLost => {
+                if !current {
+                    return;
+                }
+                warn!("本机键盘焦点或指针锁定丢失，立即回到本机");
+                if let Some((id, t)) = self.neighbors.leave() {
+                    self.perform(id, t, false);
+                }
+            }
         }
     }
 

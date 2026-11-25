@@ -1,4 +1,6 @@
-use ferry_platform_linux::{evdev_to_hid, hid_to_evdev, keymap_text, lock_keys_from_xkb};
+use ferry_platform_linux::{
+    evdev_to_hid, hid_to_evdev, keymap_text, lock_keys_from_xkb, wayland_key_to_hid,
+};
 use ferry_types::{KeyCode, LockKeys};
 
 #[test]
@@ -107,6 +109,23 @@ fn common_keys_roundtrip() {
     assert_eq!(evdev_to_hid(0), None);
     assert_eq!(evdev_to_hid(u32::MAX), None);
     assert_eq!(hid_to_evdev(KeyCode::new(1, 0)), None);
+}
+
+#[test]
+fn wayland_keycodes_are_evdev_without_an_xkb_offset() {
+    let cases = [
+        (30, KeyCode::keyboard(0x04)),
+        (6, KeyCode::keyboard(0x22)),
+        (14, KeyCode::keyboard(0x2A)),
+        (38, KeyCode::keyboard(0x0F)),
+        (42, KeyCode::LEFT_SHIFT),
+    ];
+    for (key, hid) in cases {
+        assert_eq!(wayland_key_to_hid(key), Some(hid), "Wayland key {key}");
+    }
+    assert_eq!(wayland_key_to_hid(0), None);
+    assert_eq!(wayland_key_to_hid(255), None);
+    assert_eq!(wayland_key_to_hid(u32::MAX), None);
 }
 
 #[test]

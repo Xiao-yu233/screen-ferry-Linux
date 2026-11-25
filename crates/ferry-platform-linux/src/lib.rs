@@ -22,7 +22,7 @@ pub use display::LinuxDisplays;
 pub use event_loop::LinuxEventLoop;
 pub use inject::LinuxInject;
 pub use instance::LinuxInstanceLock;
-pub use keymap::{evdev_to_hid, hid_to_evdev, keymap_text, lock_keys_from_xkb};
+pub use keymap::{evdev_to_hid, hid_to_evdev, keymap_text, lock_keys_from_xkb, wayland_key_to_hid};
 pub use overlay::LinuxOverlay;
 pub use permission::LinuxPermissions;
 pub use update::LinuxUpdater;

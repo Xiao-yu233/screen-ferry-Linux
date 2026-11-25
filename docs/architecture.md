@@ -79,7 +79,8 @@ graph BT
   app[设置界面 app/ · Flutter] -.本机回环 TCP.-> ipc
 ```
 
-Linux 面向 niri / Wayland：捕获端通过 layer-shell 上的 exclusive keyboard 与 pointer constraints 接收本机键鼠，
+Linux 面向 niri / Wayland：捕获端通过 layer-shell 上的 exclusive keyboard、pointer constraints 与 keyboard-shortcuts-inhibit 接收本机键鼠，
+抓取必须等指针锁定、键盘焦点和快捷键抑制都生效后才通知引擎；抑制被用户或合成器解除时立即交还本机控制。
 被控端用 virtual keyboard / virtual pointer 注入，显示器和光标坐标从 Wayland output 读取；不需要 root、uinput 或 evdev 权限。
 捕获层取得键盘焦点时读取当前 XKB keymap 并共享给虚拟键盘，布局变化后在下一次注入前刷新，避免按美式布局解释非美式键盘。
 Caps / Num / Scroll Lock 只依据 XKB 的 `mods_locked`；无法观察本机初始锁定状态时不猜测。剪贴板通过限时、限大小的

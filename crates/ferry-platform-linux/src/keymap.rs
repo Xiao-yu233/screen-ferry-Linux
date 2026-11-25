@@ -144,6 +144,11 @@ pub fn evdev_to_hid(evdev: u32) -> Option<KeyCode> {
         .find_map(|&(code, hid)| (code == evdev).then_some(hid))
 }
 
+/// Wayland `wl_keyboard.key` 已经是 evdev 键码，不是需要减 8 的 XKB 键码。
+pub fn wayland_key_to_hid(key: u32) -> Option<KeyCode> {
+    evdev_to_hid(key)
+}
+
 /// 将协议使用的 HID 键码转换为 virtual-keyboard 所需的 evdev 键码。
 pub fn hid_to_evdev(hid: KeyCode) -> Option<u32> {
     KEYS.iter()

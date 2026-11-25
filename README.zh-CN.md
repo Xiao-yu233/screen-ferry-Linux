@@ -67,7 +67,7 @@ sequenceDiagram
 | Windows | 在 [Releases](https://github.com/icloudza/screen-ferry/releases/latest) 下载 `ScreenFerry-<版本>-windows-x64-setup.exe` 并运行。 |
 | Arch Linux / niri | 暂需自行构建，目前没有 pacman/AUR 包或图形安装程序。先安装下面的依赖，再在仓库根目录执行 `cargo xtask bundle`。运行 `target/bundle/linux/ScreenFerry/screenferry`，或把整个目录复制到 `~/.local/opt/ScreenFerry/` 便携使用；托盘使用 KSNI，桌面需要有 Waybar 等 StatusNotifierItem 托盘宿主。Linux 直接使用 Wayland 协议，不需要 root 或 evdev 设备权限。 |
 
-Linux 目前支持键鼠共享、剪贴板同步和命令行发送文件，暂不支持边缘拖放与应用内自动更新。文件请用 `screenferry send` 发送，更新请通过包管理器或重新构建。niri 会话需要提供 wlr 虚拟指针（`zwlr_virtual_pointer_manager_v1`）、虚拟键盘（`zwp_virtual_keyboard_manager_v1`）、layer-shell、相对指针和指针锁定协议。
+Linux 目前支持键鼠共享、剪贴板同步和命令行发送文件，暂不支持边缘拖放与应用内自动更新。文件请用 `screenferry send` 发送，更新请通过包管理器或重新构建。niri 会话需要提供 wlr 虚拟指针（`zwlr_virtual_pointer_manager_v1`）、虚拟键盘（`zwp_virtual_keyboard_manager_v1`）、layer-shell、相对指针、指针锁定和键盘快捷键抑制（`zwp_keyboard_shortcuts_inhibit_manager_v1`）协议。抓取期间 niri 的普通全局快捷键会转发给远端；建议配置 `Mod+Escape allow-inhibiting=false { toggle-keyboard-shortcuts-inhibit; }` 作为立即交还本机控制的逃生键。
 
 2026-11-25 的键鼠实机验证环境为 Arch Linux x86_64（内核 `7.3.4-arch1-1`，niri `v26.04-322-g2fbc6f3b-modified`）与 macOS 15.8.3 MacBook Pro。双方各使用单个 1920×1080、100% 缩放的逻辑显示器，双向边缘切换和多次往返已通过。工具链版本及尚未覆盖的范围见[实机验证记录](docs/handoff-linux-macos.md#6-实机验证记录2026-11-25)。
 

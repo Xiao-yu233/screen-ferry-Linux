@@ -25,6 +25,10 @@ use wayland_client::protocol::wl_seat::{Capability, WlSeat};
 use wayland_client::protocol::wl_shm::Format;
 use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_surface::WlSurface;
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{
+    Event as ShortcutsInhibitorEvent, ZwpKeyboardShortcutsInhibitorV1,
+};
 use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::ZwpLockedPointerV1;
 use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::{
     Lifetime, ZwpPointerConstraintsV1,
@@ -40,7 +44,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
     Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1,
 };
 
-use crate::keymap::{evdev_to_hid, lock_keys_from_xkb, read_keymap, remember_keymap};
+use crate::keymap::{lock_keys_from_xkb, read_keymap, remember_keymap, wayland_key_to_hid};
 use crate::wayland::{
     STARTUP_TIMEOUT, Wake, connect, error, shared_file, timestamp, virtual_pointer, wait,
 };
@@ -213,7 +217,10 @@ struct CaptureState {
     seat: Option<WlSeat>,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
+    keyboard_surface: Option<usize>,
     constraints: Option<ZwpPointerConstraintsV1>,
+    shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+    shortcuts_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     relative_manager: Option<ZwpRelativePointerManagerV1>,
     virtual_pointer_manager: Option<virtual_pointer::ZwlrVirtualPointerManagerV1>,
     virtual_pointer: Option<virtual_pointer::ZwlrVirtualPointerV1>,
@@ -234,6 +241,9 @@ struct CaptureState {
     locked: Option<ZwpLockedPointerV1>,
     grab_reply: Option<mpsc::Sender<Result<()>>>,
     grab_started: Option<Instant>,
+    grab_pointer_locked: bool,
+    grab_keyboard_focused: bool,
+    grab_shortcuts_inhibited: bool,
     axis: [f64; 2],
     axis120: [i32; 2],
     axis_discrete: [i32; 2],
@@ -254,6 +264,22 @@ impl CaptureState {
     fn lock_active(&mut self) -> Result<()> {
         self.grab_origin = self.position;
         self.local_keys = self.pressed.clone();
+        self.keyboard_surface = None;
+        self.grab_pointer_locked = false;
+        self.grab_keyboard_focused = false;
+        self.grab_shortcuts_inhibited = false;
+        for layer in &self.layers {
+            let active = layer.output == self.active;
+            layer
+                .proxy
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
+            layer.surface.set_input_region(Some(if active {
+                &layer.full_region
+            } else {
+                &layer.edge_region
+            }));
+            layer.surface.commit();
+        }
         let layer = &self.layers[self.active].surface;
         let pointer = self
             .pointer
@@ -272,37 +298,69 @@ impl CaptureState {
             (),
         ));
         self.grab_started = Some(Instant::now());
+        debug!(output = self.active, "开始交接键盘焦点与指针锁定");
         Ok(())
     }
 
-    fn activate_grab(&mut self) {
+    fn request_keyboard_focus(&mut self) {
+        if self.grab_reply.is_none() {
+            return;
+        }
+        let Some(surface) = self
+            .layers
+            .get(self.active)
+            .map(|layer| layer.surface.clone())
+        else {
+            return;
+        };
+        if let (Some(manager), Some(seat)) = (&self.shortcuts_inhibit_manager, &self.seat)
+            && self.shortcuts_inhibitor.is_none()
+        {
+            self.shortcuts_inhibitor =
+                Some(manager.inhibit_shortcuts(&surface, seat, &self.qh, ()));
+            self.grab_shortcuts_inhibited = false;
+            debug!(output = self.active, "已请求 niri 抑制本机快捷键");
+        }
+        self.layers[self.active]
+            .proxy
+            .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        self.layers[self.active].surface.commit();
+        debug!(output = self.active, "指针已锁定，请求捕获层键盘焦点");
+    }
+
+    fn finish_grab_if_ready(&mut self) {
+        let shortcuts_ready =
+            self.shortcuts_inhibit_manager.is_none() || self.grab_shortcuts_inhibited;
+        if self.grab_reply.is_none()
+            || !self.grab_pointer_locked
+            || !self.grab_keyboard_focused
+            || !shortcuts_ready
+        {
+            return;
+        }
         let output = &self.outputs[self.active];
         let (width, height) = output.logical_size();
         self.position = Point::new(output.x + (width / 2), output.y + (height / 2));
-        for layer in &self.layers {
-            layer
-                .proxy
-                .set_keyboard_interactivity(if layer.output == self.active {
-                    KeyboardInteractivity::Exclusive
-                } else {
-                    KeyboardInteractivity::None
-                });
-            layer
-                .surface
-                .set_input_region(Some(if layer.output == self.active {
-                    &layer.full_region
-                } else {
-                    &layer.edge_region
-                }));
-            layer.surface.commit();
-        }
         self.grabbed = true;
+        self.grab_started = None;
+        debug!(output = self.active, shortcuts_ready, "键盘独占交接完成");
+        if let Some(reply) = self.grab_reply.take() {
+            let _ = reply.send(Ok(()));
+        }
     }
 
-    fn unlock_active(&mut self, at: Point) -> Result<()> {
+    fn reset_grab(&mut self) {
         self.grabbed = false;
+        self.grab_started = None;
+        self.grab_pointer_locked = false;
+        self.grab_keyboard_focused = false;
+        self.grab_shortcuts_inhibited = false;
+        self.keyboard_surface = None;
         if let Some(locked) = self.locked.take() {
             locked.destroy();
+        }
+        if let Some(inhibitor) = self.shortcuts_inhibitor.take() {
+            inhibitor.destroy();
         }
         self.local_keys.clear();
         self.pressed.clear();
@@ -310,6 +368,34 @@ impl CaptureState {
         self.axis = [0.0; 2];
         self.axis120 = [0; 2];
         self.axis_discrete = [0; 2];
+        for layer in &self.layers {
+            layer
+                .proxy
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
+            layer.surface.set_input_region(Some(&layer.edge_region));
+            layer.surface.commit();
+        }
+    }
+
+    fn fail_grab(&mut self, reason: &'static str) {
+        let _ = self.unlock_active(self.grab_origin);
+        if let Some(reply) = self.grab_reply.take() {
+            let _ = reply.send(Err(Error::Unsupported(reason)));
+        }
+    }
+
+    fn focus_lost(&mut self, reason: &'static str) {
+        if !self.grabbed {
+            return;
+        }
+        warn!("{reason}，立即交还本机控制");
+        self.position = self.grab_origin;
+        self.reset_grab();
+        self.emit(CaptureEvent::FocusLost, true);
+    }
+
+    fn unlock_active(&mut self, at: Point) -> Result<()> {
+        self.reset_grab();
         let output = self
             .output(self.active)
             .ok_or_else(|| error("capture", "没有活动的显示器"))?;
@@ -325,15 +411,7 @@ impl CaptureState {
             pointer.motion_absolute(timestamp(), x as u32, y as u32, width, height);
             pointer.frame();
         }
-        for layer in &self.layers {
-            layer
-                .proxy
-                .set_keyboard_interactivity(KeyboardInteractivity::None);
-            layer.surface.set_input_region(Some(&layer.edge_region));
-            layer.surface.commit();
-        }
         self.position = at;
-        self.grabbed = false;
         Ok(())
     }
 
@@ -364,13 +442,13 @@ impl CaptureState {
             edge_region.add(0, height - 1, width, 1);
             let full_region = compositor.create_region(&self.qh, ());
             full_region.add(0, 0, width, height);
-            layer
-                .surface
-                .set_input_region(Some(if self.grabbed && layer.output == self.active {
+            layer.surface.set_input_region(Some(
+                if layer.output == self.active && (self.grabbed || self.grab_reply.is_some()) {
                     &full_region
                 } else {
                     &edge_region
-                }));
+                },
+            ));
             layer.surface.commit();
             layer.edge_region.destroy();
             layer.full_region.destroy();
@@ -399,7 +477,10 @@ fn run(
         seat: None,
         pointer: None,
         keyboard: None,
+        keyboard_surface: None,
         constraints: None,
+        shortcuts_inhibit_manager: None,
+        shortcuts_inhibitor: None,
         relative_manager: None,
         virtual_pointer_manager: None,
         virtual_pointer: None,
@@ -420,6 +501,9 @@ fn run(
         locked: None,
         grab_reply: None,
         grab_started: None,
+        grab_pointer_locked: false,
+        grab_keyboard_focused: false,
+        grab_shortcuts_inhibited: false,
         axis: [0.0; 2],
         axis120: [0; 2],
         axis_discrete: [0; 2],
@@ -429,6 +513,7 @@ fn run(
     state.shm = globals.bind(&state.qh, 1..=1, ()).ok();
     state.layer_shell = globals.bind(&state.qh, 1..=4, ()).ok();
     state.constraints = globals.bind(&state.qh, 1..=1, ()).ok();
+    state.shortcuts_inhibit_manager = globals.bind(&state.qh, 1..=1, ()).ok();
     state.relative_manager = globals.bind(&state.qh, 1..=1, ()).ok();
     state.virtual_pointer_manager = globals.bind(&state.qh, 1..=1, ()).ok();
     for global in globals.contents().clone_list() {
@@ -482,6 +567,9 @@ fn run(
         || state.relative_manager.is_none()
     {
         return Err(Error::Unsupported("niri 缺少输入捕获所需协议"));
+    }
+    if state.shortcuts_inhibit_manager.is_none() {
+        warn!("Wayland 缺少 keyboard-shortcuts-inhibit，无法阻止本机全局快捷键");
     }
     for (index, output) in state.outputs.iter().enumerate() {
         let surface = state
@@ -563,11 +651,7 @@ fn run(
         if let Some(started) = state.grab_started
             && started.elapsed() > Duration::from_secs(2)
         {
-            let _ = state.unlock_active(state.grab_origin);
-            if let Some(reply) = state.grab_reply.take() {
-                let _ = reply.send(Err(Error::Unsupported("niri 没有接受指针锁定")));
-            }
-            state.grab_started = None;
+            state.fail_grab("niri 没有完成指针锁定、键盘焦点和快捷键抑制交接");
         }
         wait(&conn, &wake).map_err(|e| error("poll", e))?;
     }
@@ -917,6 +1001,54 @@ impl Dispatch<WlKeyboard, ()> for CaptureState {
         _: &QueueHandle<Self>,
     ) {
         match event {
+            wayland_client::protocol::wl_keyboard::Event::Enter { surface, keys, .. } => {
+                let index = state
+                    .layers
+                    .iter()
+                    .position(|layer| layer.surface.id() == surface.id());
+                let entered: BTreeSet<KeyCode> = keys
+                    .into_iter()
+                    .filter_map(|key| wayland_key_to_hid(u32::from(key)))
+                    .collect();
+                if state.grab_reply.is_some() {
+                    state.pressed = entered;
+                    state.local_keys = state.pressed.clone();
+                } else {
+                    state.pressed.extend(entered);
+                }
+                state.keyboard_surface = index;
+                debug!(?index, active = state.active, "捕获层键盘焦点进入");
+                if state.grab_reply.is_some() {
+                    if index == Some(state.active) && state.grab_pointer_locked {
+                        state.grab_keyboard_focused = true;
+                        state.finish_grab_if_ready();
+                    }
+                } else if state.grabbed && index != Some(state.active) {
+                    state.focus_lost("本机键盘转到了其他窗口");
+                }
+            }
+            wayland_client::protocol::wl_keyboard::Event::Leave { surface, .. } => {
+                let index = state
+                    .layers
+                    .iter()
+                    .position(|layer| layer.surface.id() == surface.id());
+                if state.keyboard_surface == index {
+                    state.keyboard_surface = None;
+                }
+                debug!(
+                    ?index,
+                    active = state.active,
+                    grabbed = state.grabbed,
+                    "捕获层键盘焦点离开"
+                );
+                if index == Some(state.active) {
+                    if state.grabbed {
+                        state.focus_lost("本机键盘焦点丢失");
+                    } else if state.grab_reply.is_some() {
+                        state.grab_keyboard_focused = false;
+                    }
+                }
+            }
             wayland_client::protocol::wl_keyboard::Event::Key {
                 key,
                 state: key_state,
@@ -925,9 +1057,18 @@ impl Dispatch<WlKeyboard, ()> for CaptureState {
                 let WEnum::Value(key_state) = key_state else {
                     return;
                 };
-                let Some(code) = evdev_to_hid(key.saturating_sub(8)) else {
+                let Some(code) = wayland_key_to_hid(key) else {
+                    debug!(raw_key = key, "忽略没有 HID 对应的 Wayland 键码");
                     return;
                 };
+                debug!(
+                    raw_key = key,
+                    ?code,
+                    hid = code.raw(),
+                    grabbed = state.grabbed,
+                    keyboard_focus = ?state.keyboard_surface,
+                    "收到 Wayland 键盘事件"
+                );
                 let action = if key_state == KeyState::Released {
                     let was_pressed = state.pressed.remove(&code);
                     let was_local = state.local_keys.remove(&code);
@@ -1019,21 +1160,22 @@ impl Dispatch<ZwpLockedPointerV1, ()> for CaptureState {
         match event {
             wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::Event::Locked => {
                 if state.locked.as_ref().is_some_and(|active| active.id() == locked.id()) {
-                    state.activate_grab();
-                    state.grab_started = None;
-                    if let Some(reply) = state.grab_reply.take() {
-                        let _ = reply.send(Ok(()));
+                    state.grab_pointer_locked = true;
+                    debug!(keyboard_focused = state.grab_keyboard_focused, "指针锁定已确认");
+                    state.request_keyboard_focus();
+                    if state.keyboard_surface == Some(state.active) {
+                        state.grab_keyboard_focused = true;
                     }
+                    state.finish_grab_if_ready();
                 }
             }
             wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::Event::Unlocked => {
                 if state.locked.as_ref().is_some_and(|active| active.id() == locked.id()) {
-                    state.grabbed = false;
-                    state.grab_started = None;
-                    if let Some(reply) = state.grab_reply.take() {
-                        let _ = reply.send(Err(Error::Unsupported("指针锁定被拒绝")));
+                    if state.grabbed {
+                        state.focus_lost("本机指针锁定丢失");
+                    } else if state.grab_reply.is_some() {
+                        state.fail_grab("niri 没有接受指针锁定");
                     }
-                    let _ = state.unlock_active(state.grab_origin);
                 }
             }
             _ => {}
@@ -1096,6 +1238,54 @@ impl Dispatch<ZwlrLayerShellV1, ()> for CaptureState {
     ) {
     }
 }
+impl Dispatch<ZwpKeyboardShortcutsInhibitManagerV1, ()> for CaptureState {
+    fn event(
+        _: &mut Self,
+        _: &ZwpKeyboardShortcutsInhibitManagerV1,
+        _: wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for CaptureState {
+    fn event(
+        state: &mut Self,
+        inhibitor: &ZwpKeyboardShortcutsInhibitorV1,
+        event: ShortcutsInhibitorEvent,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if state
+            .shortcuts_inhibitor
+            .as_ref()
+            .is_none_or(|active| active.id() != inhibitor.id())
+        {
+            return;
+        }
+        match event {
+            ShortcutsInhibitorEvent::Active => {
+                state.grab_shortcuts_inhibited = true;
+                debug!(output = state.active, "niri 快捷键抑制已生效");
+                state.finish_grab_if_ready();
+            }
+            ShortcutsInhibitorEvent::Inactive => {
+                state.grab_shortcuts_inhibited = false;
+                warn!("niri 已恢复本机快捷键");
+                if state.grabbed {
+                    state.focus_lost("本机快捷键抑制被解除");
+                } else if state.grab_reply.is_some() {
+                    state.fail_grab("niri 没有接受快捷键抑制");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<ZwpPointerConstraintsV1, ()> for CaptureState {
     fn event(
         _: &mut Self,

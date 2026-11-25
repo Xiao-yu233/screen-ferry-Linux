@@ -13,6 +13,7 @@
 - Linux 使用 XKB / Ctrl 习惯，与 macOS 的 Command / Ctrl 转换以双方实际系统为依据。
 - 虚拟键盘使用 compositor 当前 XKB keymap，覆盖非美式布局和布局切换；锁定键只读取 `mods_locked`。
 - 修复重复抓取的旧指针约束、输出旋转或分辨率变化后的输入区域，以及连续 / 高分辨率滚轮累积。
+- Linux 键盘原始事件直接按 evdev 映射为 HID，不再误减 XKB 偏移 8；进入远端同时确认指针锁定、键盘焦点与 niri 快捷键抑制，焦点或抑制意外失效时立即回本机并松开对端按键。
 - 剪贴板平台调用移出异步运行时；Linux 读写串行化，断开的旧会话不会在之后覆盖新会话内容。
 
 协议格式标记没有改变。新增系统信息使用独立能力位协商，不需要两台设备同时升级。
@@ -42,6 +43,14 @@ cd ~/.local/opt/ScreenFerry
 设置界面为 `screenferry-settings`，与后台位于同一目录。后台启动时会尝试打开它。也可以在设置界面中开启登录自启，自启文件写入 `~/.config/autostart/screenferry.desktop`；移动安装目录后应关闭再重新开启自启。
 
 Linux 暂不支持边缘拖放和应用内自动更新。文件用 `./screenferry send <文件或文件夹>` 发送，更新通过重新构建或以后的软件包完成。
+
+niri 25.02 及以上版本支持键盘快捷键抑制。ScreenFerry 抓取时会暂停普通全局快捷键，把完整组合键转发给远端；合成器仍可能保留自己的特殊逃生组合键。建议在 `~/.config/niri/binds.kdl` 中加入不会被抑制的逃生绑定：
+
+```kdl
+Mod+Escape allow-inhibiting=false { toggle-keyboard-shortcuts-inhibit; }
+```
+
+按该组合键会恢复 niri 快捷键，ScreenFerry 随即把指针和键盘交还本机。
 
 ## 3. 把源码带到 macOS
 
@@ -128,6 +137,10 @@ cargo xtask bundle --universal
 ### 4.3 Linux → Mac
 
 - 交换控制角色后重复光标切换、鼠标、拖拽、滚轮和键盘测试。
+- 在 Linux 文本编辑器依次输入 `a`、`5`、`l`、Backspace 和 Shift+字母，确认 macOS 收到的字符与物理按键一致；重点回归此前 `a` 输出 `5` 的故障。
+- 进入 macOS 后确认 Arch 前台窗口不再收到键盘；切换窗口或让 overlay 失去焦点时，光标应立即回到 Arch，且 macOS 松开所有按键。
+- 在 macOS 上测试 `Cmd+Q`、`Cmd+Space`、`Cmd+Tab` 以及 niri 中已绑定的 `Mod+Q` / `Mod+Space`，确认 Arch 不执行关闭窗口、切换布局或启动器，macOS 收到完整组合键。
+- 抓取期间按配置的 `Mod+Escape`，确认 niri 立即恢复快捷键且光标回到 Arch；鼠标再次进入 macOS 后快捷键抑制重新生效，返回 Arch 后本机快捷键恢复正常。
 - 验证 Linux 的 Ctrl 快捷键到 Mac 后是否按设置映射为 Command。
 - 断开网络或退出对端后台，确认本机立即收回控制并松开按下的键；恢复后能自动重连。
 
@@ -184,7 +197,7 @@ Linux 端执行：
 target/bundle/macos/ScreenFerry.app/Contents/MacOS/screenferry -v
 ```
 
-优先从设置界面「日志 → 运行日志」导出诊断文件。不要直接共享两台的 `identity/` 目录，设备证书必须各自生成、通过配对建立信任。排查输入问题时记录：方向、操作步骤、是否首次发生、对端系统、键盘布局、是否旋转屏幕、能否重连，以及两端日志时间。
+优先从设置界面「日志 → 运行日志」导出诊断文件。不要直接共享两台的 `identity/` 目录，设备证书必须各自生成、通过配对建立信任。排查输入问题时记录：方向、操作步骤、是否首次发生、对端系统、键盘布局、是否旋转屏幕、能否重连，以及两端日志时间。Linux 日志会记录 Wayland 原始键码、HID、键盘焦点和指针锁定状态；macOS 日志记录 HID 与注入键码，可逐级核对。
 
 ## 6. 实机验证记录（2026-11-25）
 
@@ -199,7 +212,7 @@ target/bundle/macos/ScreenFerry.app/Contents/MacOS/screenferry -v
 | 相对位置 | Mac 屏幕位于 Linux 左侧；Linux 以 `--side left` 运行 | 通过局域网连接 Linux |
 | 构建工具 | Rust 1.91.0；Flutter 3.47.9 / Dart 3.13.7 | Rust 1.91.0；Flutter 3.47.9 / Dart 3.13.7；Xcode 26.3 |
 
-连接使用同一局域网、mDNS 发现和 TLS 1.3。测试期间 Linux 使用最新调试/发布构建，Mac 使用包含显示器回退修复的用户级应用。
+连接使用同一局域网、mDNS 发现和 TLS 1.3。最终复测时 Linux 使用发布构建 `8b61beda657c15deb5f24d66e82ad4f2a0b41541f74a3f188f5a2add07b091c2`，Mac 使用用户级应用；旧后台通过内置 `SIGINT` 路径优雅退出后完成替换。
 本文记录的是实际测试环境，不代表所有 Arch 发行版版本、niri 版本或显示器组合都已覆盖。
 
 ### 6.2 已通过
@@ -210,13 +223,12 @@ target/bundle/macos/ScreenFerry.app/Contents/MacOS/screenferry -v
 - **显示器协商**：Linux 与 Mac 均报告 1920×1080、100% 缩放；Mac 在活动显示器列表为空时回退到在线显示器列表。
 - **文本剪贴板**：完成一次 Linux→Mac 文本同步；未覆盖图片、多 MIME 和频繁更新。
 - **Linux 生命周期**：独立数据目录下，最新后台完成 IPC 就绪、设置界面连接和官方 `screenferry quit` 优雅退出。
-- **构建与静态检查**：Linux 与 Mac 全工作区各 390 项 Rust 测试通过、2 项忽略；`cargo fmt --all --check`、全工作区 Clippy（`-D warnings`）、`cargo xtask lint` 均通过。Flutter 侧此前完成 120 项测试、分析、Linux/macOS release 构建。
+- **构建与静态检查**：最终 Linux 全工作区 393 项 Rust 测试通过、2 项忽略；`cargo fmt --all --check`、全工作区 Clippy（`-D warnings`）、`cargo xtask lint` 和 macOS 目标编译检查均通过。Flutter 侧此前完成 120 项测试、分析、Linux/macOS release 构建。
 - **实机修复范围**：wlr 虚拟指针协议、`wl_shm`/XKB fd 可读性、layer-shell configure 时序、`Current|Preferred` 输出模式、启动与 grab/release 确认、Mac 休眠显示器回退均已纳入本次验证。
+- **最终键盘复测**：Linux→macOS 普通字母、数字、符号与组合键输入正常；`Cmd+Q`、`Cmd+Space`、`Cmd+Tab` 及 niri 已绑定的 `Mod+Q` / `Mod+Space` 不再触发 Arch 本地动作。`Super+Escape` 能立即解除抑制并回到 Arch，再次进入 macOS 后独占恢复正常。
 
 ### 6.3 尚未完成或未覆盖
 
-- 重新签名后的 Mac 应用需要用户在「系统设置 → 隐私与安全性 → 辅助功能」中重新允许 ScreenFerry，尚未用该新签名完成最后一轮自动复测。
-- 已安装新版 Linux 后台；此前卡住的旧进程仍持有 `instance.lock`，需用户确认结束后替换常驻实例。
 - 文件传输、非美式键盘布局、锁定键、滚轮方向、多显示器热插拔、屏幕旋转和长时间重连尚未完成系统化实机验收。
 - `cargo deny check` 未执行成功，因为当前构建环境未安装 `cargo-deny`。
 
