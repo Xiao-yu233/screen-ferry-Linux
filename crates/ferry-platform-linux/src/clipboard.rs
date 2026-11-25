@@ -153,7 +153,7 @@ impl Clipboard for LinuxClipboard {
 }
 
 fn read_clipboard() -> Result<ClipboardContent> {
-    let listed = run_command("wl-paste", &["--list", "--no-newline"], None)?;
+    let listed = run_command("wl-paste", &["--list-types"], None)?;
     if !listed.status.success() {
         let detail = String::from_utf8_lossy(&listed.stderr);
         if detail.contains("Nothing is copied") || detail.contains("No selection") {

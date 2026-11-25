@@ -24,6 +24,7 @@
 - README、架构与 IPC 文档补齐 Arch 依赖、niri 协议要求、KSNI 托盘、XDG 数据目录和 Linux 打包方式；
   明确应用内自动更新仍只支持 macOS 和 Windows。
 - 新增 Linux / niri 与 macOS 交接文档，记录源码传输、macOS 编译、Linux 便携运行、双机验收和日志采集步骤。
+- 补充 2026-11-25 的 Arch / niri 与 macOS 实机记录：列出主机、niri、macOS、显示器与工具链版本，明确双向边缘切换已通过，以及文件传输、多显示器和锁定键等待覆盖范围。
 - Linux 不声明 `EDGE_DROP`，不会向对端发送自己无法处理的边缘投递提示；文件命令和普通文件传输照常工作。
 
 ### 修复
@@ -31,6 +32,19 @@
 - 修正连接事件把本机系统误报成对端系统的问题；实际系统改由握手后的 `PlatformInfo` 告知。
 - 设置页恢复 Windows 的「Windows 习惯」和对应文本快捷键文案，Linux 继续显示「PC / XKB 习惯」。
 - Linux GTK runner 改用 `G_APPLICATION_DEFAULT_FLAGS`，避免新版 GTK 的弃用警告阻断启用 `-Werror` 的构建。
+- Linux 虚拟指针改用 wlr-protocols 的 `zwlr_virtual_pointer_manager_v1` / `zwlr_virtual_pointer_v1`。
+  niri、Hyprland 等合成器实现的是这个接口，原先绑定的 `zwp_virtual_pointer_manager_v1` 并不存在，会在启动时直接报「缺少协议」；
+  同时按官方定义修正 `motion_absolute` 的参数顺序、补上 `axis_discrete` 的 value 参数，并把水平 / 垂直滚轮映射到正确的轴向。
+- 修复 Linux 捕获层和虚拟键盘把只写文件句柄交给 niri 的问题。`wl_shm` 缓冲区与 XKB keymap 都要由合成器 mmap，
+  只写句柄会以 `EACCES` 失败，niri 随即发出 `wl_shm: invalid_fd` 并断开整个连接；两处现在统一通过读写句柄创建临时文件，
+  并用 `PROT_READ|PROT_WRITE + MAP_SHARED` 与 `PROT_READ + MAP_PRIVATE` 两种映射做回归测试。捕获层还改为
+  「先空 commit → 收到 configure → attach 缓冲区 → ack/commit」，与 niri 自身的 layer-shell 客户端测试时序一致。
+- 修复 Linux 捕获和输入注入的启动就绪信号发得过晚，导致初始化完成后仍一直等待、设置界面连不上后台的问题；
+  现在初始化完成即通知调用方，启动等待有超时和取消边界。XKB keymap 改为从 fd 偏移 0 读取，兼容 niri 把文件位置留在末尾的行为。
+- 修复 Linux 捕获层避让 niri 面板 exclusive zone、附加过小缓冲导致边缘收不到指针，以及把 `Current|Preferred` 模式误判为无效的问题；
+  捕获层现在按 configure 尺寸创建完整共享缓冲，尚未 configure 的 layer 不会在其他输出更新时被提前提交。
+- Linux grab/release 改为等待 Wayland 线程确认，指针锁定完成后才标记抓取；相对位移保留亚像素余数，避免慢速移动丢失。
+- macOS 活动显示器列表为空时回退到在线显示器列表，避免显示器休眠或唤醒期间向对端报告空布局。
 
 ## [0.2.0] - 2026-11-10
 

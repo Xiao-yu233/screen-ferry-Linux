@@ -63,7 +63,7 @@ fn check_wayland_protocols() -> Result<()> {
         "zwlr_layer_shell_v1",
         "zwp_pointer_constraints_v1",
         "zwp_relative_pointer_manager_v1",
-        "zwp_virtual_pointer_manager_v1",
+        "zwlr_virtual_pointer_manager_v1",
         "zwp_virtual_keyboard_manager_v1",
     ];
     let missing: Vec<&str> = REQUIRED

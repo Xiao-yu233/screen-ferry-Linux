@@ -4,3 +4,4 @@ mod autostart;
 mod clipboard;
 mod instance;
 mod keymap;
+mod shared_fd;

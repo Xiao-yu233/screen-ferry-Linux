@@ -2,11 +2,15 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use wayland_client::Connection;
 
 use ferry_platform::Error;
+
+pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) mod virtual_keyboard {
     #[allow(clippy::single_component_path_imports)]
@@ -36,25 +40,25 @@ pub(crate) mod virtual_keyboard {
 pub(crate) mod virtual_pointer {
     #[allow(clippy::single_component_path_imports)]
     use wayland_client;
-    use wayland_client::protocol::{wl_seat, wl_seat::WlSeat};
+    use wayland_client::protocol::{wl_output, wl_seat, wl_seat::WlSeat};
     use wayland_client::{Dispatch, QueueHandle};
 
     pub mod __interfaces {
         use wayland_client::protocol::__interfaces::*;
-        wayland_scanner::generate_interfaces!("src/protocols/virtual-pointer-unstable-v1.xml");
+        wayland_scanner::generate_interfaces!("src/protocols/wlr-virtual-pointer-unstable-v1.xml");
     }
     use self::__interfaces::*;
-    wayland_scanner::generate_client_code!("src/protocols/virtual-pointer-unstable-v1.xml");
+    wayland_scanner::generate_client_code!("src/protocols/wlr-virtual-pointer-unstable-v1.xml");
 
-    pub use self::zwp_virtual_pointer_manager_v1::ZwpVirtualPointerManagerV1;
-    pub use self::zwp_virtual_pointer_v1::ZwpVirtualPointerV1;
+    pub use self::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
+    pub use self::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
 
     pub fn create(
-        manager: &ZwpVirtualPointerManagerV1,
+        manager: &ZwlrVirtualPointerManagerV1,
         seat: &WlSeat,
-        qh: &QueueHandle<impl Dispatch<ZwpVirtualPointerV1, ()> + 'static>,
-    ) -> ZwpVirtualPointerV1 {
-        manager.create_virtual_pointer(seat, qh, ())
+        qh: &QueueHandle<impl Dispatch<ZwlrVirtualPointerV1, ()> + 'static>,
+    ) -> ZwlrVirtualPointerV1 {
+        manager.create_virtual_pointer(Some(seat), qh, ())
     }
 }
 
@@ -69,9 +73,10 @@ pub(crate) fn connect() -> Result<Connection, Error> {
     Connection::connect_to_env().map_err(|e| error("connect_to_env", e))
 }
 
+#[derive(Clone)]
 pub(crate) struct Wake {
-    read: OwnedFd,
-    write: OwnedFd,
+    read: std::sync::Arc<OwnedFd>,
+    write: std::sync::Arc<OwnedFd>,
 }
 
 impl Wake {
@@ -81,8 +86,8 @@ impl Wake {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
-            read: unsafe { OwnedFd::from_raw_fd(fds[0]) },
-            write: unsafe { OwnedFd::from_raw_fd(fds[1]) },
+            read: std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(fds[0]) }),
+            write: std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(fds[1]) }),
         })
     }
 
@@ -98,20 +103,13 @@ impl Wake {
     }
 }
 
-pub(crate) fn wait(
-    conn: &Connection,
-    wake: &Wake,
-    stop: &std::sync::atomic::AtomicBool,
-) -> io::Result<bool> {
-    if stop.load(std::sync::atomic::Ordering::SeqCst) {
-        return Ok(false);
-    }
+pub(crate) fn wait(conn: &Connection, wake: &Wake) -> io::Result<()> {
     conn.flush().map_err(|error| match error {
         wayland_client::backend::WaylandError::Io(error) => error,
         error => io::Error::other(error),
     })?;
     let Some(guard) = conn.prepare_read() else {
-        return Ok(true);
+        return Ok(());
     };
     let mut fds = [
         libc::pollfd {
@@ -154,7 +152,7 @@ pub(crate) fn wait(
     if fds[1].revents & libc::POLLIN != 0 {
         wake.clear();
     }
-    Ok(true)
+    Ok(())
 }
 
 pub(crate) fn timestamp() -> u32 {
@@ -163,4 +161,33 @@ pub(crate) fn timestamp() -> u32 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_millis() as u32
+}
+
+static NEXT_SHARED_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// 创建要交给合成器 mmap 的临时文件：wl_shm 缓冲区和 XKB keymap 都走这里。
+///
+/// 合成器会以 `PROT_READ|PROT_WRITE` + `MAP_SHARED` 映射 wl_shm 的 fd，keymap 也需要
+/// `PROT_READ`；句柄必须以读写方式打开。只写句柄会让 mmap 以 EACCES 失败，合成器随即
+/// 按协议错误（wl_shm 的 invalid_fd）断开整个连接。调用方在 flush 之后删除路径即可，
+/// 合成器持有的是自己收到的 fd 副本。
+pub fn shared_file(bytes: &[u8], suffix: &str) -> Result<(std::fs::File, PathBuf), Error> {
+    use std::io::{Seek, SeekFrom, Write};
+    let path = std::env::temp_dir().join(format!(
+        "screenferry-{}-{}-{}.{}",
+        std::process::id(),
+        timestamp(),
+        NEXT_SHARED_FILE.fetch_add(1, Ordering::Relaxed),
+        suffix,
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| error("shared_file", e))?;
+    file.write_all(bytes).map_err(|e| error("shared_file", e))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| error("shared_file", e))?;
+    Ok((file, path))
 }

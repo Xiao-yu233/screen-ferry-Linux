@@ -2,13 +2,14 @@
 
 use std::collections::BTreeSet;
 use std::os::fd::AsFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ferry_platform::{Error, InputInject, Result};
 use ferry_types::{InputEvent, KeyAction, KeyCode, LockKeys, Point, WHEEL_NOTCH};
+use tracing::warn;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_output::{Mode, Transform, WlOutput};
@@ -19,7 +20,10 @@ use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 use crate::keymap::{
     current_keymap, hid_to_evdev, keymap_text, lock_keys_from_xkb, updated_keymap,
 };
-use crate::wayland::{Wake, connect, error, timestamp, virtual_keyboard, virtual_pointer, wait};
+use crate::wayland::{
+    STARTUP_TIMEOUT, Wake, connect, error, shared_file, timestamp, virtual_keyboard,
+    virtual_pointer, wait,
+};
 
 enum Command {
     Event(InputEvent, mpsc::Sender<Result<()>>),
@@ -40,18 +44,22 @@ impl LinuxInject {
         let (tx, rx) = mpsc::channel();
         let wake = Wake::new().map_err(|e| error("pipe2", e))?;
         let thread_wake = Wake::new().map_err(|e| error("pipe2", e))?;
+        let startup_wake = thread_wake.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let thread_alive = Arc::clone(&alive);
         let (ready_tx, ready_rx) = mpsc::channel();
+        let startup_tx = tx.clone();
         let thread = std::thread::Builder::new()
             .name("ferry-wayland-inject".into())
             .spawn(move || {
-                let result = run(rx, thread_wake, Arc::clone(&thread_alive));
+                if let Err(e) = run(rx, thread_wake, &ready_tx) {
+                    warn!("Wayland 输入注入已停止：{e}");
+                    let _ = ready_tx.send(Err(e));
+                }
                 thread_alive.store(false, Ordering::SeqCst);
-                let _ = ready_tx.send(result);
             })
             .map_err(|e| error("thread::spawn", e))?;
-        match ready_rx.recv() {
+        match ready_rx.recv_timeout(STARTUP_TIMEOUT + Duration::from_secs(1)) {
             Ok(Ok(())) => Ok(Self {
                 commands: Some(tx),
                 wake: Some(wake),
@@ -62,7 +70,13 @@ impl LinuxInject {
                 let _ = thread.join();
                 Err(e)
             }
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                alive.store(false, Ordering::SeqCst);
+                let _ = startup_tx.send(Command::Stop);
+                startup_wake.notify();
+                Err(Error::Failed("Wayland 输入注入启动超时".into()))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = thread.join();
                 Err(error("inject", "输入线程意外退出"))
             }
@@ -157,8 +171,8 @@ struct InjectState {
     qh: QueueHandle<InjectState>,
     seat: Option<WlSeat>,
     keyboard_observer: Option<WlKeyboard>,
-    pointer_manager: Option<virtual_pointer::ZwpVirtualPointerManagerV1>,
-    pointer: Option<virtual_pointer::ZwpVirtualPointerV1>,
+    pointer_manager: Option<virtual_pointer::ZwlrVirtualPointerManagerV1>,
+    pointer: Option<virtual_pointer::ZwlrVirtualPointerV1>,
     keyboard_manager: Option<virtual_keyboard::ZwpVirtualKeyboardManagerV1>,
     keyboard: Option<virtual_keyboard::ZwpVirtualKeyboardV1>,
     outputs: Vec<OutputInfo>,
@@ -190,7 +204,7 @@ impl InjectState {
             .pointer
             .as_ref()
             .ok_or_else(|| error("inject", "没有虚拟指针"))?;
-        pointer.motion_absolute(timestamp(), x, width as u32, y, height as u32);
+        pointer.motion_absolute(timestamp(), x, y, width as u32, height as u32);
         pointer.frame();
         self.position = position;
         Ok(())
@@ -322,12 +336,14 @@ impl InjectState {
                     .as_ref()
                     .ok_or_else(|| error("inject", "没有虚拟指针"))?;
                 pointer.axis_source(1);
-                for (axis, value) in [(0, dx), (1, dy)] {
+                // wl_pointer.axis 里 0 是垂直滚动、1 是水平滚动，与直觉相反。
+                for (axis, value) in [(1, dx), (0, dy)] {
                     if value == 0 {
                         continue;
                     }
-                    pointer.axis(timestamp(), axis, f64::from(value) / f64::from(WHEEL_NOTCH));
-                    pointer.axis_discrete(timestamp(), axis, value / WHEEL_NOTCH);
+                    let steps = f64::from(value) / f64::from(WHEEL_NOTCH);
+                    pointer.axis(timestamp(), axis, steps);
+                    pointer.axis_discrete(timestamp(), axis, steps, value / WHEEL_NOTCH);
                 }
                 pointer.frame();
                 Ok(())
@@ -353,38 +369,25 @@ impl InjectState {
     }
 }
 
-static NEXT_KEYMAP: AtomicU64 = AtomicU64::new(0);
-
 fn apply_keymap(
     keyboard: &virtual_keyboard::ZwpVirtualKeyboardV1,
     bytes: &[u8],
     conn: &Connection,
 ) -> Result<()> {
-    let path = std::env::temp_dir().join(format!(
-        "screenferry-{}-{}-{}.xkb",
-        std::process::id(),
-        timestamp(),
-        NEXT_KEYMAP.fetch_add(1, Ordering::Relaxed),
-    ));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|e| error("xkb", e))?;
-    let result = (|| {
-        use std::io::Write;
-        file.try_clone()
-            .map_err(|e| error("xkb", e))?
-            .write_all(bytes)
-            .map_err(|e| error("xkb", e))?;
+    let (file, path) = shared_file(bytes, "xkb")?;
+    let result = {
         keyboard.keymap(1, file.as_fd(), bytes.len() as u32);
         conn.flush().map_err(|e| error("flush", e))
-    })();
+    };
     let _ = std::fs::remove_file(path);
     result
 }
 
-fn run(commands: mpsc::Receiver<Command>, wake: Wake, alive: Arc<AtomicBool>) -> Result<()> {
+fn run(
+    commands: mpsc::Receiver<Command>,
+    wake: Wake,
+    ready: &mpsc::Sender<Result<()>>,
+) -> Result<()> {
     let conn = connect()?;
     let (globals, mut queue) =
         registry_queue_init::<InjectState>(&conn).map_err(|e| error("registry_queue_init", e))?;
@@ -466,7 +469,9 @@ fn run(commands: mpsc::Receiver<Command>, wake: Wake, alive: Arc<AtomicBool>) ->
     queue
         .roundtrip(&mut state)
         .map_err(|e| error("roundtrip", e))?;
-    while alive.load(Ordering::SeqCst) {
+    // 就绪表示初始化完成，不能等下面的常驻事件循环结束才通知。
+    let _ = ready.send(Ok(()));
+    loop {
         queue
             .dispatch_pending(&mut state)
             .map_err(|e| error("dispatch", e))?;
@@ -515,11 +520,8 @@ fn run(commands: mpsc::Receiver<Command>, wake: Wake, alive: Arc<AtomicBool>) ->
                 Command::Stop => return Ok(()),
             }
         }
-        if !wait(&conn, &wake, &alive).map_err(|e| error("poll", e))? {
-            break;
-        }
+        wait(&conn, &wake).map_err(|e| error("poll", e))?;
     }
-    Ok(())
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for InjectState {
@@ -558,15 +560,13 @@ impl Dispatch<WlOutput, usize> for InjectState {
                 );
             }
             wayland_client::protocol::wl_output::Event::Mode {
-                flags,
+                flags: WEnum::Value(flags),
                 width,
                 height,
                 ..
-            } => {
-                if flags == WEnum::Value(Mode::Current) {
-                    output.width = width;
-                    output.height = height;
-                }
+            } if flags.contains(Mode::Current) => {
+                output.width = width;
+                output.height = height;
             }
             wayland_client::protocol::wl_output::Event::Scale { factor } => output.scale = factor,
             _ => {}
@@ -609,22 +609,22 @@ impl Dispatch<WlKeyboard, ()> for InjectState {
     }
 }
 
-impl Dispatch<virtual_pointer::ZwpVirtualPointerManagerV1, ()> for InjectState {
+impl Dispatch<virtual_pointer::ZwlrVirtualPointerManagerV1, ()> for InjectState {
     fn event(
         _: &mut Self,
-        _: &virtual_pointer::ZwpVirtualPointerManagerV1,
-        _: virtual_pointer::zwp_virtual_pointer_manager_v1::Event,
+        _: &virtual_pointer::ZwlrVirtualPointerManagerV1,
+        _: virtual_pointer::zwlr_virtual_pointer_manager_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
     }
 }
-impl Dispatch<virtual_pointer::ZwpVirtualPointerV1, ()> for InjectState {
+impl Dispatch<virtual_pointer::ZwlrVirtualPointerV1, ()> for InjectState {
     fn event(
         _: &mut Self,
-        _: &virtual_pointer::ZwpVirtualPointerV1,
-        _: virtual_pointer::zwp_virtual_pointer_v1::Event,
+        _: &virtual_pointer::ZwlrVirtualPointerV1,
+        _: virtual_pointer::zwlr_virtual_pointer_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,

@@ -156,6 +156,17 @@ Linux 端执行：
 - 开启自启后检查 `~/.config/autostart/screenferry.desktop`，注销并重新登录验证。
 - Linux 使用 `./screenferry quit` 退出；macOS 使用托盘菜单退出。
 
+### 4.7 协议自检失败
+
+后台启动提示「当前 Wayland 合成器缺少 ScreenFerry 所需协议」时，反馈缺少的完整接口名。必需的接口是：
+`zwlr_layer_shell_v1`、`zwp_pointer_constraints_v1`、`zwp_relative_pointer_manager_v1`、`zwlr_virtual_pointer_manager_v1`、`zwp_virtual_keyboard_manager_v1`。
+虚拟指针来自 wlr-protocols（`zwlr_` 前缀），虚拟键盘来自 weston 协议（`zwp_` 前缀），前缀不同是协议本身的命名，不能按同名前缀推断。
+用 `wayland-info`（部分发行版由 `wayland-utils` 包提供）列出当前会话公布的接口，再与上面的清单对照。
+
+若错误是 `Backend error: Protocol error ... wl_shm ... Failed to mmap fd`，表示合成器无法映射客户端传来的共享内存 fd。
+先确认后台已换成最新构建；需要定位时从终端运行 `WAYLAND_DEBUG=1 ~/.local/share/screenferry/ScreenFerry/screenferry -v`
+并保留完整协议日志，尤其是断开前最后一个请求与出错对象。wl_shm 缓冲区和 XKB keymap 的 fd 都必须可读，只写打开会让 mmap 以 `EACCES` 失败。
+
 ## 5. 日志与数据位置
 
 | 平台 | 配置与配对 | 日志与运行时文件 |
@@ -175,14 +186,42 @@ target/bundle/macos/ScreenFerry.app/Contents/MacOS/screenferry -v
 
 优先从设置界面「日志 → 运行日志」导出诊断文件。不要直接共享两台的 `identity/` 目录，设备证书必须各自生成、通过配对建立信任。排查输入问题时记录：方向、操作步骤、是否首次发生、对端系统、键盘布局、是否旋转屏幕、能否重连，以及两端日志时间。
 
-## 6. 已知限制与尚未完成的验证
+## 6. 实机验证记录（2026-11-25）
 
-- 尚未在真实 Arch / niri 与 macOS 硬件上完成端到端验收。
-- 已在 Debian 13 容器安装 Flutter 3.47.9 / Dart 3.13.7 和临时 GTK 工具链；`flutter gen-l10n`、`dart format`、`flutter analyze`、`flutter test`（120 项）、`flutter build linux --release`、`cargo xtask bundle` 均通过，构建出的设置界面已成功启动并持续运行 15 秒。真实 Arch / niri 图形交互仍待验证；容器启动时存在 GTK 主题 `color-mix` 与软件 OpenGL 的环境警告，不影响窗口运行。
-- macOS 编译与安装已在真实 Mac（x86_64，macOS 15.8.3，Xcode 26.3）完成：Rust 1.91.0 下 `cargo fmt --check`、`cargo test --workspace`、`cargo clippy -D warnings`、`cargo xtask lint`（16 个 crate）全部通过；Flutter 3.47.9 / Dart 3.13.7 下 `gen-l10n`、`dart format`（0 改动）、`analyze`（无问题）、`flutter test`（120 项）全部通过；`cargo xtask bundle` 生成临时签名的 `ScreenFerry.app`，已安装到 `~/Applications/ScreenFerry.app` 并启动，后台常驻、设置界面 2.8 秒连上后台。共享键鼠前仍需在「系统设置 → 隐私与安全性 → 辅助功能」允许 ScreenFerry；双机端到端互通仍待验收。
-- 本副本缺少 macOS 应用图标 PNG（`app/macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_*.png`），直接 `cargo xtask bundle` 会在组装阶段报 `AppIcon.icns` 不存在。先运行 `cargo xtask icons`（需要 `rsvg-convert`，macOS 上 `brew install librsvg`）导出图标再打包；没有 brew 时可在另一台机器用 rsvg-convert 按 `xtask/src/icons.rs` 的尺寸规则导出后复制过去。
+### 6.1 测试系统
+
+| 项目 | Linux 控制端 | macOS 被控端 |
+|---|---|---|
+| 系统 | Arch Linux，x86_64 | macOS 15.8.3（24H241），x86_64 MacBook Pro |
+| 内核 / 桌面 | Linux `7.3.4-arch1-1`；niri `v26.04-322-g2fbc6f3b-modified`（Wayland） | 原生 macOS 图形会话 |
+| 处理器 | Intel Core i5-12400F | 未记录 |
+| 显示器 | 单个逻辑输出，1920×1080，100% 缩放 | 握手报告单个逻辑显示器，1920×1080，100% 缩放 |
+| 相对位置 | Mac 屏幕位于 Linux 左侧；Linux 以 `--side left` 运行 | 通过局域网连接 Linux |
+| 构建工具 | Rust 1.91.0；Flutter 3.47.9 / Dart 3.13.7 | Rust 1.91.0；Flutter 3.47.9 / Dart 3.13.7；Xcode 26.3 |
+
+连接使用同一局域网、mDNS 发现和 TLS 1.3。测试期间 Linux 使用最新调试/发布构建，Mac 使用包含显示器回退修复的用户级应用。
+本文记录的是实际测试环境，不代表所有 Arch 发行版版本、niri 版本或显示器组合都已覆盖。
+
+### 6.2 已通过
+
+- **双向边缘切换**：Linux 左边缘推到 Mac、Mac 右边缘推回 Linux，以及多次连续往返均成功；日志和接收端指针坐标都确认控制权交接。
+- **Linux 捕获链**：niri 的 layer-shell 输入区域、pointer constraints 锁定、relative pointer、虚拟指针和虚拟键盘初始化通过；锁定后事件正确标记为 `grabbed=true`。
+- **位移质量**：Wayland `f64` 亚像素位移先累积再发送，慢速移动和反向移动不再逐事件丢失。
+- **显示器协商**：Linux 与 Mac 均报告 1920×1080、100% 缩放；Mac 在活动显示器列表为空时回退到在线显示器列表。
+- **文本剪贴板**：完成一次 Linux→Mac 文本同步；未覆盖图片、多 MIME 和频繁更新。
+- **Linux 生命周期**：独立数据目录下，最新后台完成 IPC 就绪、设置界面连接和官方 `screenferry quit` 优雅退出。
+- **构建与静态检查**：Linux 与 Mac 全工作区各 390 项 Rust 测试通过、2 项忽略；`cargo fmt --all --check`、全工作区 Clippy（`-D warnings`）、`cargo xtask lint` 均通过。Flutter 侧此前完成 120 项测试、分析、Linux/macOS release 构建。
+- **实机修复范围**：wlr 虚拟指针协议、`wl_shm`/XKB fd 可读性、layer-shell configure 时序、`Current|Preferred` 输出模式、启动与 grab/release 确认、Mac 休眠显示器回退均已纳入本次验证。
+
+### 6.3 尚未完成或未覆盖
+
+- 重新签名后的 Mac 应用需要用户在「系统设置 → 隐私与安全性 → 辅助功能」中重新允许 ScreenFerry，尚未用该新签名完成最后一轮自动复测。
+- 已安装新版 Linux 后台；此前卡住的旧进程仍持有 `instance.lock`，需用户确认结束后替换常驻实例。
+- 文件传输、非美式键盘布局、锁定键、滚轮方向、多显示器热插拔、屏幕旋转和长时间重连尚未完成系统化实机验收。
+- `cargo deny check` 未执行成功，因为当前构建环境未安装 `cargo-deny`。
+
+## 7. 已知限制
+
+- Linux 富剪贴板一次只写一个 MIME 类型；边缘拖放和应用内更新未实现。
 - 首次获得捕获层键盘焦点前，虚拟键盘使用内置美式 keymap；当前布局会在捕获层收到 keymap 后共享。若首次输入异常，先等待一次正常键盘焦点再复测。
 - 无法观察本机初始 Caps / Num / Scroll Lock 状态时，锁定键同步会拒绝猜测，而不是发送错误状态。
-- Linux 富剪贴板一次只写一个 MIME 类型；边缘拖放和应用内更新未实现。
-- `cargo deny check` 尚未执行成功，cargo-deny 在当前构建环境中未安装。
-- 没有创建提交、tag 或推送远端；项目副本当前不含 `.git`，macOS 上测试时以本目录为基准保留修改。

@@ -26,3 +26,4 @@ pub use keymap::{evdev_to_hid, hid_to_evdev, keymap_text, lock_keys_from_xkb};
 pub use overlay::LinuxOverlay;
 pub use permission::LinuxPermissions;
 pub use update::LinuxUpdater;
+pub use wayland::shared_file;

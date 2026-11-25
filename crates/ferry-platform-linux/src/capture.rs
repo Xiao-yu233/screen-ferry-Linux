@@ -2,14 +2,20 @@
 
 use std::collections::BTreeSet;
 use std::os::fd::AsFd;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ferry_platform::{CaptureEvent, CaptureSink, Captured, Error, InputCapture, Result};
-use ferry_types::{KeyAction, KeyCode, LockKeys, Point, WHEEL_NOTCH};
+use ferry_types::{KeyAction, KeyCode, LockKeys, Point, RelativeMotionAccumulator, WHEEL_NOTCH};
+use tracing::{debug, warn};
+use wayland_client::Connection;
+use wayland_client::Dispatch;
+use wayland_client::Proxy;
+use wayland_client::QueueHandle;
+use wayland_client::WEnum;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
+use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_keyboard::{KeyState, WlKeyboard};
 use wayland_client::protocol::wl_output::{Mode, Transform, WlOutput};
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState, Event as PointerEvent, WlPointer};
@@ -19,7 +25,6 @@ use wayland_client::protocol::wl_seat::{Capability, WlSeat};
 use wayland_client::protocol::wl_shm::Format;
 use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::ZwpLockedPointerV1;
 use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::{
     Lifetime, ZwpPointerConstraintsV1,
@@ -36,7 +41,9 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
 };
 
 use crate::keymap::{evdev_to_hid, lock_keys_from_xkb, read_keymap, remember_keymap};
-use crate::wayland::{Wake, connect, error, timestamp, virtual_pointer, wait};
+use crate::wayland::{
+    STARTUP_TIMEOUT, Wake, connect, error, shared_file, timestamp, virtual_pointer, wait,
+};
 
 #[derive(Debug)]
 enum Command {
@@ -77,18 +84,20 @@ impl InputCapture for LinuxCapture {
         let (tx, rx) = mpsc::channel();
         let wake = Wake::new().map_err(|e| error("pipe2", e))?;
         let thread_wake = Wake::new().map_err(|e| error("pipe2", e))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
+        let startup_wake = thread_wake.clone();
+        let startup_tx = tx.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         let locks = Arc::clone(&self.locks);
         let thread = std::thread::Builder::new()
             .name("ferry-wayland-capture".into())
             .spawn(move || {
-                let result = run(rx, thread_wake, thread_stop, sink, locks);
-                let _ = ready_tx.send(result);
+                if let Err(e) = run(rx, thread_wake, sink, locks, &ready_tx) {
+                    warn!("Wayland 输入捕获已停止：{e}");
+                    let _ = ready_tx.send(Err(e));
+                }
             })
             .map_err(|e| error("thread::spawn", e))?;
-        match ready_rx.recv() {
+        match ready_rx.recv_timeout(STARTUP_TIMEOUT + Duration::from_secs(1)) {
             Ok(Ok(())) => {
                 self.commands = Some(tx);
                 self.wake = Some(wake);
@@ -99,7 +108,12 @@ impl InputCapture for LinuxCapture {
                 let _ = thread.join();
                 Err(e)
             }
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = startup_tx.send(Command::Stop);
+                startup_wake.notify();
+                Err(Error::Failed("Wayland 捕获启动超时".into()))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = thread.join();
                 Err(error("capture", "捕获线程意外退出"))
             }
@@ -107,11 +121,11 @@ impl InputCapture for LinuxCapture {
     }
 
     fn grab(&self) -> Result<()> {
-        self.command(GrabCommand::Grab).map(|_| ())
+        self.command(GrabCommand::Grab)
     }
 
     fn release(&self, at: Point) -> Result<()> {
-        self.command(GrabCommand::Release(at)).map(|_| ())
+        self.command(GrabCommand::Release(at))
     }
 
     fn lock_keys(&self) -> LockKeys {
@@ -125,7 +139,7 @@ enum GrabCommand {
 }
 
 impl LinuxCapture {
-    fn command(&self, command: GrabCommand) -> Result<mpsc::Receiver<Result<()>>> {
+    fn command(&self, command: GrabCommand) -> Result<()> {
         let Some(tx) = &self.commands else {
             return Err(Error::Unsupported("捕获尚未开始"));
         };
@@ -137,7 +151,9 @@ impl LinuxCapture {
         tx.send(command)
             .map_err(|_| error("capture", "捕获线程已退出"))?;
         self.wake.as_ref().map(Wake::notify);
-        Ok(response)
+        response
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| error("capture", "捕获线程没有响应"))?
     }
 }
 
@@ -183,7 +199,10 @@ struct CaptureLayer {
     surface: WlSurface,
     edge_region: WlRegion,
     full_region: WlRegion,
+    buffer: Option<WlBuffer>,
     output: usize,
+    width: u32,
+    height: u32,
 }
 
 struct CaptureState {
@@ -196,8 +215,9 @@ struct CaptureState {
     keyboard: Option<WlKeyboard>,
     constraints: Option<ZwpPointerConstraintsV1>,
     relative_manager: Option<ZwpRelativePointerManagerV1>,
-    virtual_pointer_manager: Option<virtual_pointer::ZwpVirtualPointerManagerV1>,
-    virtual_pointer: Option<virtual_pointer::ZwpVirtualPointerV1>,
+    virtual_pointer_manager: Option<virtual_pointer::ZwlrVirtualPointerManagerV1>,
+    virtual_pointer: Option<virtual_pointer::ZwlrVirtualPointerV1>,
+    pending_shared: Vec<(std::fs::File, std::path::PathBuf)>,
     relative: Option<ZwpRelativePointerV1>,
     shared_locks: Arc<std::sync::Mutex<LockKeys>>,
     outputs: Vec<OutputInfo>,
@@ -217,6 +237,7 @@ struct CaptureState {
     axis: [f64; 2],
     axis120: [i32; 2],
     axis_discrete: [i32; 2],
+    relative_motion: RelativeMotionAccumulator,
 }
 
 impl CaptureState {
@@ -232,34 +253,7 @@ impl CaptureState {
 
     fn lock_active(&mut self) -> Result<()> {
         self.grab_origin = self.position;
-        let output = self
-            .output(self.active)
-            .ok_or_else(|| error("capture", "没有活动的显示器"))?;
-        let (width, height) = output.logical_size();
-        let width = u32::try_from(width).unwrap_or(1);
-        let height = u32::try_from(height).unwrap_or(1);
-        self.position = Point::new(
-            output.x + (width / 2) as i32,
-            output.y + (height / 2) as i32,
-        );
         self.local_keys = self.pressed.clone();
-        for layer in &self.layers {
-            layer
-                .proxy
-                .set_keyboard_interactivity(if layer.output == self.active {
-                    KeyboardInteractivity::Exclusive
-                } else {
-                    KeyboardInteractivity::None
-                });
-            layer
-                .surface
-                .set_input_region(Some(if layer.output == self.active {
-                    &layer.full_region
-                } else {
-                    &layer.edge_region
-                }));
-            layer.surface.commit();
-        }
         let layer = &self.layers[self.active].surface;
         let pointer = self
             .pointer
@@ -277,9 +271,32 @@ impl CaptureState {
             &self.qh,
             (),
         ));
-        self.grabbed = true;
         self.grab_started = Some(Instant::now());
         Ok(())
+    }
+
+    fn activate_grab(&mut self) {
+        let output = &self.outputs[self.active];
+        let (width, height) = output.logical_size();
+        self.position = Point::new(output.x + (width / 2), output.y + (height / 2));
+        for layer in &self.layers {
+            layer
+                .proxy
+                .set_keyboard_interactivity(if layer.output == self.active {
+                    KeyboardInteractivity::Exclusive
+                } else {
+                    KeyboardInteractivity::None
+                });
+            layer
+                .surface
+                .set_input_region(Some(if layer.output == self.active {
+                    &layer.full_region
+                } else {
+                    &layer.edge_region
+                }));
+            layer.surface.commit();
+        }
+        self.grabbed = true;
     }
 
     fn unlock_active(&mut self, at: Point) -> Result<()> {
@@ -305,7 +322,7 @@ impl CaptureState {
             let pointer = self
                 .virtual_pointer
                 .get_or_insert_with(|| virtual_pointer::create(manager, seat, &self.qh));
-            pointer.motion_absolute(timestamp(), x as u32, width, y as u32, height);
+            pointer.motion_absolute(timestamp(), x as u32, y as u32, width, height);
             pointer.frame();
         }
         for layer in &self.layers {
@@ -325,12 +342,21 @@ impl CaptureState {
             return;
         };
         for index in 0..self.layers.len() {
+            // 尚未 configure 的 layer 没有缓冲区，不能在这里提前提交。
+            if self.layers[index].buffer.is_none() {
+                continue;
+            }
             let output_index = self.layers[index].output;
-            let (width, height) = self
+            let output_size = self
                 .output(output_index)
                 .map(OutputInfo::logical_size)
                 .unwrap_or((1, 1));
             let layer = &mut self.layers[index];
+            let (width, height) = if layer.buffer.is_some() {
+                (layer.width as i32, layer.height as i32)
+            } else {
+                output_size
+            };
             let edge_region = compositor.create_region(&self.qh, ());
             edge_region.add(0, 0, 1, height);
             edge_region.add(width - 1, 0, 1, height);
@@ -357,9 +383,9 @@ impl CaptureState {
 fn run(
     commands: mpsc::Receiver<Command>,
     wake: Wake,
-    stop: Arc<AtomicBool>,
     sink: CaptureSink,
     locks: Arc<std::sync::Mutex<LockKeys>>,
+    ready: &mpsc::Sender<Result<()>>,
 ) -> Result<()> {
     let conn = connect()?;
     let (globals, mut queue) =
@@ -377,6 +403,7 @@ fn run(
         relative_manager: None,
         virtual_pointer_manager: None,
         virtual_pointer: None,
+        pending_shared: Vec::new(),
         relative: None,
         shared_locks: locks,
         outputs: Vec::new(),
@@ -396,6 +423,7 @@ fn run(
         axis: [0.0; 2],
         axis120: [0; 2],
         axis_discrete: [0; 2],
+        relative_motion: RelativeMotionAccumulator::default(),
     };
     state.compositor = globals.bind(&state.qh, 1..=6, ()).ok();
     state.shm = globals.bind(&state.qh, 1..=1, ()).ok();
@@ -455,21 +483,6 @@ fn run(
     {
         return Err(Error::Unsupported("niri 缺少输入捕获所需协议"));
     }
-    let path = std::env::temp_dir().join(format!(
-        "screenferry-{}-{}.shm",
-        std::process::id(),
-        timestamp()
-    ));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|e| error("shm", e))?;
-    file.set_len(4).map_err(|e| error("shm", e))?;
-    let shm = state.shm.as_ref().unwrap();
-    let pool = shm.create_pool(file.as_fd(), 4, &state.qh, ());
-    let buffer = pool.create_buffer(0, 1, 1, 4, Format::Argb8888, &state.qh, ());
-    pool.destroy();
     for (index, output) in state.outputs.iter().enumerate() {
         let surface = state
             .compositor
@@ -485,7 +498,7 @@ fn run(
             index,
         );
         layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-        layer.set_exclusive_zone(0);
+        layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         let (width, height) = output.logical_size();
         let compositor = state.compositor.as_ref().unwrap();
@@ -497,15 +510,16 @@ fn run(
         let full_region = compositor.create_region(&state.qh, ());
         full_region.add(0, 0, width, height);
         surface.set_input_region(Some(&edge_region));
-        surface.attach(Some(&buffer), 0, 0);
-        surface.damage(0, 0, 1, 1);
         surface.commit();
         state.layers.push(CaptureLayer {
             proxy: layer,
             surface,
             edge_region,
             full_region,
+            buffer: None,
             output: index,
+            width: 0,
+            height: 0,
         });
     }
     queue
@@ -519,13 +533,16 @@ fn run(
             .get_relative_pointer(state.pointer.as_ref().unwrap(), &state.qh, ());
         state.relative = Some(relative);
     }
-    drop(buffer);
-    let _ = std::fs::remove_file(path);
+    // 就绪表示初始化完成，不能等下面的常驻事件循环结束才通知。
+    let _ = ready.send(Ok(()));
     loop {
         queue
             .dispatch_pending(&mut state)
             .map_err(|e| error("dispatch", e))?;
         conn.flush().map_err(|e| error("flush", e))?;
+        for (_, path) in state.pending_shared.drain(..) {
+            let _ = std::fs::remove_file(path);
+        }
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Grab(reply) => {
@@ -540,7 +557,7 @@ fn run(
                     let result = state.unlock_active(at);
                     let _ = reply.send(result);
                 }
-                Command::Stop => break,
+                Command::Stop => return Ok(()),
             }
         }
         if let Some(started) = state.grab_started
@@ -552,11 +569,8 @@ fn run(
             }
             state.grab_started = None;
         }
-        if !wait(&conn, &wake, &stop).map_err(|e| error("poll", e))? {
-            break;
-        }
+        wait(&conn, &wake).map_err(|e| error("poll", e))?;
     }
-    Ok(())
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for CaptureState {
@@ -617,15 +631,13 @@ impl Dispatch<WlOutput, usize> for CaptureState {
                 );
             }
             wayland_client::protocol::wl_output::Event::Mode {
-                flags,
+                flags: WEnum::Value(flags),
                 width,
                 height,
                 ..
-            } => {
-                if flags == WEnum::Value(Mode::Current) {
-                    info.width = width;
-                    info.height = height;
-                }
+            } if flags.contains(Mode::Current) => {
+                info.width = width;
+                info.height = height;
             }
             wayland_client::protocol::wl_output::Event::Scale { factor } => info.scale = factor,
             wayland_client::protocol::wl_output::Event::Name { name } => info.name = name,
@@ -669,11 +681,66 @@ impl Dispatch<ZwlrLayerSurfaceV1, usize> for CaptureState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
+            wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
                 surface.ack_configure(serial);
-                if let Some(layer) = state.layers.get(*index) {
+                let output_size = state
+                    .layers
+                    .get(*index)
+                    .and_then(|layer| state.output(layer.output))
+                    .map(OutputInfo::logical_size)
+                    .unwrap_or((1, 1));
+                let Some(layer) = state.layers.get_mut(*index) else {
+                    return;
+                };
+                if layer.buffer.is_some() && layer.width == width && layer.height == height {
                     layer.surface.commit();
+                    return;
                 }
+                let (width, height) = if width == 0 || height == 0 {
+                    output_size
+                } else {
+                    (width as i32, height as i32)
+                };
+                let width = width.max(1) as u32;
+                let height = height.max(1) as u32;
+                let Some(byte_len) = width
+                    .checked_mul(height)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .filter(|&size| size <= 256 * 1024 * 1024)
+                else {
+                    warn!(width, height, "捕获层尺寸无效");
+                    surface.destroy();
+                    return;
+                };
+                let (file, path) = match shared_file(&vec![0; byte_len as usize], "shm") {
+                    Ok(shared) => shared,
+                    Err(error) => {
+                        warn!("创建捕获层共享缓冲失败：{error}");
+                        surface.destroy();
+                        return;
+                    }
+                };
+                let shm = state.shm.as_ref().unwrap();
+                let pool = shm.create_pool(file.as_fd(), byte_len as i32, &state.qh, ());
+                let buffer = pool.create_buffer(
+                    0,
+                    width as i32,
+                    height as i32,
+                    width as i32 * 4,
+                    Format::Argb8888,
+                    &state.qh,
+                    (),
+                );
+                pool.destroy();
+                layer.surface.attach(Some(&buffer), 0, 0);
+                layer.surface.damage(0, 0, width as i32, height as i32);
+                if let Some(previous) = layer.buffer.replace(buffer) {
+                    previous.destroy();
+                }
+                layer.width = width;
+                layer.height = height;
+                state.pending_shared.push((file, path));
+                state.update_regions();
             }
             wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event::Closed => surface.destroy(),
             _ => {}
@@ -710,6 +777,13 @@ impl Dispatch<WlPointer, ()> for CaptureState {
                         output.x + surface_x.round() as i32,
                         output.y + surface_y.round() as i32,
                     );
+                    debug!(
+                        output = state.active,
+                        surface_x,
+                        surface_y,
+                        position = ?state.position,
+                        "捕获层收到指针进入"
+                    );
                 }
             }
             PointerEvent::Leave { surface, .. } => {
@@ -719,6 +793,7 @@ impl Dispatch<WlPointer, ()> for CaptureState {
                     .any(|layer| layer.surface.id() == surface.id())
                 {
                     state.pointer_inside = false;
+                    debug!("捕获层收到指针离开");
                 }
             }
             PointerEvent::Motion {
@@ -900,11 +975,24 @@ impl Dispatch<ZwpRelativePointerV1, ()> for CaptureState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let RelativePointerEvent::RelativeMotion { dx, dy, .. } = event
+        if let RelativePointerEvent::RelativeMotion {
+            dx: raw_dx,
+            dy: raw_dy,
+            ..
+        } = event
             && (state.grabbed || state.pointer_inside)
         {
-            let dx = dx as i32;
-            let dy = dy as i32;
+            let (dx, dy) = state.relative_motion.update(raw_dx, raw_dy);
+            debug!(
+                position = ?state.position,
+                raw_dx,
+                raw_dy,
+                dx,
+                dy,
+                grabbed = state.grabbed,
+                inside = state.pointer_inside,
+                "捕获层收到相对移动"
+            );
             if dx != 0 || dy != 0 {
                 state.emit(
                     CaptureEvent::Pointer {
@@ -931,6 +1019,7 @@ impl Dispatch<ZwpLockedPointerV1, ()> for CaptureState {
         match event {
             wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::Event::Locked => {
                 if state.locked.as_ref().is_some_and(|active| active.id() == locked.id()) {
+                    state.activate_grab();
                     state.grab_started = None;
                     if let Some(reply) = state.grab_reply.take() {
                         let _ = reply.send(Ok(()));
@@ -974,10 +1063,10 @@ impl Dispatch<WlShm, ()> for CaptureState {
     ) {
     }
 }
-impl Dispatch<wayland_client::protocol::wl_buffer::WlBuffer, ()> for CaptureState {
+impl Dispatch<WlBuffer, ()> for CaptureState {
     fn event(
         _: &mut Self,
-        _: &wayland_client::protocol::wl_buffer::WlBuffer,
+        _: &WlBuffer,
         _: wayland_client::protocol::wl_buffer::Event,
         _: &(),
         _: &Connection,
@@ -1029,22 +1118,22 @@ impl Dispatch<ZwpRelativePointerManagerV1, ()> for CaptureState {
     ) {
     }
 }
-impl Dispatch<virtual_pointer::ZwpVirtualPointerManagerV1, ()> for CaptureState {
+impl Dispatch<virtual_pointer::ZwlrVirtualPointerManagerV1, ()> for CaptureState {
     fn event(
         _: &mut Self,
-        _: &virtual_pointer::ZwpVirtualPointerManagerV1,
-        _: virtual_pointer::zwp_virtual_pointer_manager_v1::Event,
+        _: &virtual_pointer::ZwlrVirtualPointerManagerV1,
+        _: virtual_pointer::zwlr_virtual_pointer_manager_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
     }
 }
-impl Dispatch<virtual_pointer::ZwpVirtualPointerV1, ()> for CaptureState {
+impl Dispatch<virtual_pointer::ZwlrVirtualPointerV1, ()> for CaptureState {
     fn event(
         _: &mut Self,
-        _: &virtual_pointer::ZwpVirtualPointerV1,
-        _: virtual_pointer::zwp_virtual_pointer_v1::Event,
+        _: &virtual_pointer::ZwlrVirtualPointerV1,
+        _: virtual_pointer::zwlr_virtual_pointer_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,

@@ -612,6 +612,16 @@ where
 
         match captured.event {
             CaptureEvent::Pointer { position, dx, dy } => {
+                debug!(
+                    ?position,
+                    dx,
+                    dy,
+                    grabbed = captured.grabbed,
+                    remote = remote.is_some(),
+                    current,
+                    local = ?self.local,
+                    "收到指针捕获事件"
+                );
                 if !current {
                     return;
                 }

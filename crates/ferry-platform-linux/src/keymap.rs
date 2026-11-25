@@ -1,8 +1,9 @@
 //! Linux evdev 键码与 USB HID 用法的转换。
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::FileExt;
 use std::sync::{Mutex, OnceLock};
 
 use ferry_types::{KeyCode, LockKeys};
@@ -209,16 +210,16 @@ pub(crate) fn updated_keymap(generation: u64) -> Option<(u64, Vec<u8>)> {
 }
 
 pub(crate) fn read_keymap(fd: OwnedFd, size: u32) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::from(fd)
-        .take(u64::from(size))
-        .read_to_end(&mut bytes)?;
-    if bytes.is_empty() {
+    let size = size as usize;
+    if size == 0 || size > 16 * 1024 * 1024 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "XKB keymap 为空",
+            "XKB keymap 大小无效",
         ));
     }
+    let mut bytes = vec![0; size];
+    // 合成器可能把 fd 的读写位置留在末尾；协议要求从偏移 0 读取 keymap。
+    File::from(fd).read_exact_at(&mut bytes, 0)?;
     if bytes.last() != Some(&0) {
         bytes.push(0);
     }
