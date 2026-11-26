@@ -1448,7 +1448,7 @@ impl<H: Host> Runtime<H> {
         let Ok(fingerprint) = fingerprint.parse::<Fingerprint>() else {
             return;
         };
-        let mut peers = match self.store.peers() {
+        let peers = match self.store.peers() {
             Ok(peers) => peers,
             Err(e) => {
                 return self.toast(
@@ -1457,19 +1457,52 @@ impl<H: Host> Runtime<H> {
                 );
             }
         };
+        if !peers.contains(&fingerprint) {
+            self.refresh_peers();
+            return;
+        }
+
+        // 先终止正在进行的配对，晚到的配对成功才不会再把设备写回来。
+        self.stop_engine().await;
+        let hex = fingerprint.to_hex();
+        let cancelled: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.prompt.fingerprint == hex)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in cancelled {
+            self.pending.remove(&id);
+            self.broadcast(Notice::PairingClosed { id });
+        }
+
+        let mut peers = match self.store.peers() {
+            Ok(peers) => peers,
+            Err(e) => {
+                self.toast(
+                    Phrase::new("peers_read_failed").arg("message", &e),
+                    format!("读取已配对设备失败：{e}"),
+                );
+                self.start_engine();
+                return;
+            }
+        };
         let Some(name) = peers.get(&fingerprint).map(|p| p.name.clone()) else {
+            self.refresh_peers();
+            self.start_engine();
             return;
         };
         peers.remove(&fingerprint);
         if let Err(e) = self.store.save_peers(&peers) {
-            return self.toast(
+            self.toast(
                 Phrase::new("remove_failed").arg("message", &e),
                 format!("移除失败：{e}"),
             );
+            self.start_engine();
+            return;
         }
         self.refresh_peers();
         // 它的位置安排和单独设置也不再需要。
-        let hex = fingerprint.to_hex();
         if self.config.layout.iter().any(|p| p.fingerprint == hex)
             || self.config.devices.iter().any(|d| d.fingerprint == hex)
         {
@@ -1481,6 +1514,16 @@ impl<H: Host> Runtime<H> {
                 Err(e) => warn!("保存设置失败：{e}"),
             }
         }
+        self.found.retain(|f| f.fingerprint != fingerprint);
+        self.last_seen.remove(&fingerprint);
+        self.platforms.remove(&fingerprint);
+        self.versions.remove(&fingerprint);
+        if self.clipboard_peer == Some(fingerprint) {
+            self.clipboard_peer = None;
+        }
+        if self.show_device.as_ref().is_some_and(|(fp, _)| *fp == hex) {
+            self.show_device = None;
+        }
         let phrase = Phrase::new("removed").arg("name", &name);
         self.log(
             LogKind::Link,
@@ -1490,10 +1533,7 @@ impl<H: Host> Runtime<H> {
             "下次连接需要重新配对",
         );
         self.toast(phrase, format!("已移除 {name}"));
-        // 正连着这台：断开它，它下次来要重新配对。
-        if self.links.iter().any(|l| l.fingerprint == fingerprint) {
-            self.restart_engine().await;
-        }
+        self.start_engine();
     }
 
     /// 客户端：连接局域网里发现的一台服务端。只连这一次，不把地址写死。

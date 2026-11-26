@@ -29,6 +29,7 @@
 
 ### 修复
 
+- 删除已配对设备时，设置界面不再先在本地隐藏设备，而是等待后台状态确认；后台先停止连接与配对再落盘删除，避免晚到的配对成功把设备重新写回。命令行 `forget` 也会同步清理该设备的布局和单独设置。
 - 修正连接事件把本机系统误报成对端系统的问题；实际系统改由握手后的 `PlatformInfo` 告知。
 - 设置页恢复 Windows 的「Windows 习惯」和对应文本快捷键文案，Linux 继续显示「PC / XKB 习惯」。
 - Linux GTK runner 改用 `G_APPLICATION_DEFAULT_FLAGS`，避免新版 GTK 的弃用警告阻断启用 `-Werror` 的构建。
@@ -44,6 +45,9 @@
 - 修复 Linux 捕获层避让 niri 面板 exclusive zone、附加过小缓冲导致边缘收不到指针，以及把 `Current|Preferred` 模式误判为无效的问题；
   捕获层现在按 configure 尺寸创建完整共享缓冲，尚未 configure 的 layer 不会在其他输出更新时被提前提交。
 - Linux grab/release 改为等待 Wayland 线程确认，指针锁定完成后才标记抓取；相对位移保留亚像素余数，避免慢速移动丢失。
+- 修正 Linux 把 Wayland `wl_keyboard.key` 再减去 XKB 偏移 8 的问题；原始键码本身就是 evdev，直接映射为 HID，避免控制 macOS 时整片按键错位。
+- Linux 进入远端前同时等待指针锁定和 layer-shell 键盘焦点确认，不再只凭指针锁定就发送 `Enter`；抓取期间焦点或锁定意外丢失时立即交还本机并通知对端松开按键。
+- Linux 接入 niri 的 `keyboard-shortcuts-inhibit`，抓取时等待抑制生效，避免 `Mod+Q` 等组合键被本机桌面先消费；用户恢复本机快捷键时立即收回控制，并建议配置 `Mod+Escape` 逃生绑定。
 - macOS 活动显示器列表为空时回退到在线显示器列表，避免显示器休眠或唤醒期间向对端报告空布局。
 
 ## [0.2.0] - 2026-11-10

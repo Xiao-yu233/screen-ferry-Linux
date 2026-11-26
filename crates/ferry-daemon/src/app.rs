@@ -329,6 +329,17 @@ fn forget(store: &Store, target: &str) -> Result<(), Box<dyn std::error::Error>>
         [fingerprint] => {
             peers.remove(fingerprint);
             store.save_peers(&peers)?;
+            match store.config() {
+                Ok(mut config) => {
+                    let hex = fingerprint.to_hex();
+                    config.layout.retain(|p| p.fingerprint != hex);
+                    config.devices.retain(|d| d.fingerprint != hex);
+                    if let Err(e) = store.save_config(&config) {
+                        eprintln!("设备已取消配对，但清理设备设置失败：{e}");
+                    }
+                }
+                Err(e) => eprintln!("设备已取消配对，但读取设备设置失败：{e}"),
+            }
             println!("已删除 {fingerprint}，下次连接需要重新配对。");
             Ok(())
         }

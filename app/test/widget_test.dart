@@ -744,6 +744,19 @@ void main() {
     expect(find.text('办公室 PC 在本机右侧，光标从相接的那条边穿过去'), findsOneWidget);
   });
 
+  testWidgets('删除设备在后台确认前保持显示', (tester) async {
+    final backend = DemoBackend(animate: false, confirmForget: false);
+    final state = await launch(tester, const Size(1160, 780), backend: backend);
+    final peer = state.peers.first;
+
+    state.forget(peer);
+    await settle(tester);
+
+    expect(backend.sent.last, isA<ForgetRequest>());
+    expect((backend.sent.last as ForgetRequest).fingerprint, peer.fingerprint);
+    expect(state.peers.map((p) => p.fingerprint), contains(peer.fingerprint));
+  });
+
   testWidgets('还没有配对的设备时布局页只显示本机', (tester) async {
     final state = await launch(tester, const Size(1160, 780), backend: DemoBackend(animate: false, paired: false));
     state.go(SfPage.layout);

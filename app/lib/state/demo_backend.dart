@@ -17,6 +17,7 @@ class DemoBackend implements Backend {
     String? platform,
     this.animate = true,
     this.startOnline = true,
+    this.confirmForget = true,
     bool paired = true,
     this._problem,
     ClipboardSync? clipboard,
@@ -72,6 +73,7 @@ class DemoBackend implements Backend {
   final String platform;
   final bool animate;
   final bool startOnline;
+  final bool confirmForget;
 
   /// 收到的命令，测试里检查用。
   final sent = <Request>[];
@@ -274,6 +276,7 @@ class DemoBackend implements Backend {
         final name = _nameOf(fingerprint);
         emit(ToastNotice('已在 $name 上打开设置，把光标移过去就能改', phrase: Phrase('peer_settings_opened', {'name': name})));
       case ForgetRequest(:final fingerprint):
+        if (!confirmForget) break;
         final gone = _peers.where((p) => p.fingerprint == fingerprint).toList();
         _peers.removeWhere((p) => p.fingerprint == fingerprint);
         if (_cursor == fingerprint) _cursor = null;
@@ -290,6 +293,7 @@ class DemoBackend implements Backend {
           _addLog(LogKind.link, LogIcon.unlink, '已移除 ${p.name}', '下次连接需要重新配对', phrase: phrase);
           emit(ToastNotice('已移除 ${p.name}', phrase: phrase));
         }
+        _emitState();
       case ConnectRequest(:final fingerprint):
         final device = _found.where((d) => d.fingerprint == fingerprint).firstOrNull;
         if (device != null) {

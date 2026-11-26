@@ -240,7 +240,6 @@ class AppState extends ChangeNotifier {
   final _pendingDevices = <String, (DeviceSettings, DateTime)>{};
   bool? _pendingSharing;
   DateTime _pendingSharingAt = DateTime.fromMillisecondsSinceEpoch(0);
-  final _forgotten = <String>{};
   final _freshPeers = <String, DateTime>{};
 
   // ── 按地址连接与邀请 ──
@@ -356,10 +355,7 @@ class AppState extends ChangeNotifier {
 
   // ── 设备 ──
 
-  List<PeerInfo> get peers => [
-    for (final p in _daemon?.peers ?? const <PeerInfo>[])
-      if (!_forgotten.contains(p.fingerprint)) p,
-  ];
+  List<PeerInfo> get peers => _daemon?.peers ?? const <PeerInfo>[];
 
   List<FoundDevice> get found => [
     for (final f in _daemon?.found ?? const <FoundDevice>[])
@@ -543,7 +539,6 @@ class AppState extends ChangeNotifier {
 
   void forget(PeerInfo peer) {
     if (!_send(ForgetRequest(peer.fingerprint))) return;
-    _forgotten.add(peer.fingerprint);
     if (openedDevice == peer.fingerprint) openedDevice = null;
     notifyListeners();
   }
@@ -740,7 +735,6 @@ class AppState extends ChangeNotifier {
     _pendingDevices.removeWhere(
       (fp, pending) => now.difference(pending.$2) > _pendingTimeout || state.settings.device(fp) == pending.$1,
     );
-    _forgotten.retainWhere((fp) => state.peers.any((p) => p.fingerprint == fp));
     _applyAppearance();
   }
 

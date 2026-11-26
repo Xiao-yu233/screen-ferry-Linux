@@ -426,9 +426,101 @@ async fn first_pairing_is_confirmed_in_the_ui() {
 
     // 从界面移除它：断开，并从信任列表删掉。
     let fingerprint = state.peers[0].fingerprint.clone();
-    ui.send(Request::Forget { fingerprint }).await;
+    ui.send(Request::SetDevice {
+        device: ferry_types::DeviceSettings {
+            fingerprint: fingerprint.clone(),
+            alias: "临时别名".into(),
+            ..ferry_types::DeviceSettings::new(fingerprint.clone())
+        },
+    })
+    .await;
+    ui.send(Request::UpdateSettings {
+        settings: SettingsPatch {
+            layout: Some(vec![ferry_types::Placement {
+                fingerprint: fingerprint.clone(),
+                side: Side::Top,
+            }]),
+            ..SettingsPatch::default()
+        },
+    })
+    .await;
+    ui.state_where("设备设置已保存", |s| {
+        s.settings
+            .devices
+            .iter()
+            .any(|d| d.fingerprint == fingerprint && d.alias == "临时别名")
+            && s.settings
+                .layout
+                .iter()
+                .any(|p| p.fingerprint == fingerprint)
+    })
+    .await;
+    ui.send(Request::Forget {
+        fingerprint: fingerprint.clone(),
+    })
+    .await;
     ui.state_where("移除后列表为空", |s| s.peers.is_empty())
         .await;
+    assert!(daemon.device.store.peers().unwrap().is_empty());
+    let saved = daemon.device.store.config().unwrap();
+    assert!(saved.devices.iter().all(|d| d.fingerprint != fingerprint));
+    assert!(saved.layout.iter().all(|p| p.fingerprint != fingerprint));
+
+    let state = ui
+        .state_where("删除后回到等待连接", |s| {
+            s.link.status == LinkStatus::Waiting && s.peers.is_empty()
+        })
+        .await;
+    let port = state.local.port.expect("重启后报告监听的端口");
+
+    // 删除只取消本机信任；对端仍信任本机。断开旧客户端，再模拟它重连。
+    client.abort();
+    let _ = client.await;
+    let pc_confirm = AutoConfirm::answering(true);
+    let client = tokio::spawn(connect(
+        ClientConfig {
+            server: ServerAddr::Fixed(([127, 0, 0, 1], port).into()),
+            name: "pc".into(),
+            clipboard: true,
+            clipboard_limit: Default::default(),
+            platform: "test",
+            command_key: false,
+            edge_drop: true,
+            store: pc.store.clone(),
+            events: Events::none(),
+            files: Files::new(&pc.store, Events::none()),
+            edge: EdgeFeed::none(),
+            devices: Vec::new(),
+            commands: None,
+            invite_port: None,
+        },
+        MockInject::new(),
+        MockDisplays::new(vec![Display {
+            id: DisplayId(1),
+            bounds: Rect::new(0, 0, 1920, 1080),
+            scale_percent: 150,
+            primary: true,
+        }]),
+        MockClipboard::new(),
+        pc_confirm.clone(),
+    ));
+
+    let prompt = ui
+        .wait("删除后重连需要重新配对", |n| match n {
+            Notice::Pairing { prompt } => Some(prompt.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(prompt.fingerprint, fingerprint);
+    assert!(
+        daemon.device.store.peers().unwrap().is_empty(),
+        "出现配对提示不等于已经重新信任"
+    );
+    ui.send(Request::PairReply {
+        id: prompt.id,
+        accept: false,
+    })
+    .await;
     assert!(daemon.device.store.peers().unwrap().is_empty());
 
     client.abort();
